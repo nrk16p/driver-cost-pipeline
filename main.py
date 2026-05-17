@@ -72,26 +72,27 @@ WORK_GROUP_MAP = {
 
 
 def fetch_driver_cost(mongo_client: MongoClient) -> pd.DataFrame:
-    """Query drivercost_tail and return LDT summary grouped by mmyy + driver name."""
-    year = str(datetime.now().year)
+    """Query drivercost_tail for current month only, return LDT summary by driver."""
+    now = datetime.now()
+    mmyy = now.strftime("%m/%Y")  # e.g. "05/2026"
     collection = mongo_client[config.ATMS_DB][config.DRIVERCOST_COLLECTION]
 
+    # project only columns we need to minimise memory
+    projection = {
+        "_id": 0,
+        "ออก LDT": 1, "mmyy": 1, "บริการ": 1, "LDT": 1,
+        "พจส1": 1, "น้ำหนักปลายทาง": 1,
+    }
     cursor = collection.find(
         {
-            "mmyy": {"$regex": rf"/{year}$"},
+            "mmyy": mmyy,
             "report_title": {"$regex": "ลาดกระบัง", "$options": "i"},
         },
-        {"_id": 0},
+        projection,
     )
     df = pd.DataFrame(list(cursor))
-    log.info(f"drivercost_tail: {len(df)} rows")
+    log.info(f"drivercost_tail ({mmyy}): {len(df)} rows")
 
-    cols = [
-        "ออก LDT", "mmyy", "บริการ", "LDT", "แพล้นท์", "Route/Ship To", "subcode",
-        "ชื่อshipto", "โซน", "รหัสต้นทาง", "ชื่อต้นทาง", "รหัสปลายทาง",
-        "พจส1", "ประเภทรถร่วม", "เลขรถ", "หัว", "น้ำหนักปลายทาง",
-    ]
-    df = df[cols].copy()
     df["น้ำหนักปลายทาง"] = pd.to_numeric(df["น้ำหนักปลายทาง"], errors="coerce").fillna(0).astype(int)
     df = df[df["บริการ"] == "Mixer เอเชีย - MIXB"]
 
@@ -109,11 +110,28 @@ def fetch_driver_cost(mongo_client: MongoClient) -> pd.DataFrame:
 
 
 def fetch_vehicle_daily(mongo_client: MongoClient) -> pd.DataFrame:
-    """Query vehicle_daily_asia and return working-day rows for Asia fleet."""
+    """Query vehicle_daily_asia for current month, Asia fleet only."""
+    now = datetime.now()
+    mmyy = now.strftime("%m/%Y")
     collection = mongo_client[config.ATMS_DB][config.VEHICLE_DAILY_COLLECTION]
-    df = pd.DataFrame(list(collection.find({}, {"_id": 0})))
-    df = df[df["ฟลีท"] == "Asia"]
 
+    projection = {
+        "_id": 0,
+        "วันที่": 1, "ฟลีท": 1, "ลูกค้า": 1, "รหัส": 1, "แพล้นท์": 1,
+        "เบอร์รถ": 1, "ทะเบียน": 1, "สถานะ": 1, "คนขับ": 1, "รหัสคนขับ": 1, "ชื่อคนขับ": 1,
+    }
+    # filter by fleet and current month via mmyy field
+    cursor = collection.find({"ฟลีท": "Asia", "mmyy": mmyy}, projection)
+    df = pd.DataFrame(list(cursor))
+
+    if df.empty:
+        # fallback: mmyy field may not exist — filter by date prefix in วันที่
+        cursor = collection.find({"ฟลีท": "Asia"}, projection)
+        df = pd.DataFrame(list(cursor))
+        df["mmyy_tmp"] = df["วันที่"].astype(str).str[3:10]
+        df = df[df["mmyy_tmp"] == mmyy].drop(columns=["mmyy_tmp"])
+
+    log.info(f"vehicle_daily_asia ({mmyy}): {len(df)} raw rows")
     df = df[["วันที่", "ฟลีท", "ลูกค้า", "รหัส", "แพล้นท์", "เบอร์รถ",
              "ทะเบียน", "สถานะ", "คนขับ", "รหัสคนขับ", "ชื่อคนขับ"]].copy()
 
