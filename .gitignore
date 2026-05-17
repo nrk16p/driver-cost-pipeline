@@ -1,0 +1,24 @@
+# Credentials — never commit these
+.env
+credentials/service_account.json
+credentials/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Jupyter leftovers
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log
+logs/
+
+# macOS
+.DS_Store
