@@ -2,8 +2,8 @@ pipeline {
     agent any
 
     triggers {
-        // 9:00 AM Bangkok (UTC+7) = 02:00 UTC every day
-        cron('0 2 * * *')
+        // 11:00 AM Bangkok (UTC+7) = 04:00 UTC every day
+        cron('0 4 * * *')
     }
 
     environment {
