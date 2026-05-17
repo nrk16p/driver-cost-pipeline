@@ -303,7 +303,19 @@ def upsert_to_mongo(mongo_client: MongoClient, df: pd.DataFrame) -> None:
 
 def main():
     log.info("=== Driver Cost Pipeline START ===")
-    mongo_client = MongoClient(config.MONGO_URI)
+    mongo_client = MongoClient(
+        config.MONGO_URI,
+        serverSelectionTimeoutMS=60000,
+        connectTimeoutMS=30000,
+        socketTimeoutMS=60000,
+    )
+    # verify connection before proceeding
+    try:
+        mongo_client.admin.command("ping")
+        log.info("MongoDB connected OK")
+    except Exception as e:
+        log.error(f"MongoDB connection failed: {e}")
+        raise
 
     try:
         ldt_summary = fetch_driver_cost(mongo_client)
