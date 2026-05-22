@@ -172,6 +172,13 @@ def fetch_gsheet_trips(df_work: pd.DataFrame) -> pd.DataFrame:
     ws = spreadsheet.worksheet("4tripdata")
     df_gpm = pd.DataFrame(ws.get_all_records())
     df_gpm["Date"] = pd.to_datetime(df_gpm["Date"], format="%Y-%m-%d", errors="coerce")
+    # fill NaT dates reconstructed from Month + Day columns (Date column is blank for older rows)
+    reconstructed = pd.to_datetime(
+        df_gpm["Month"].astype(str) + "-" + df_gpm["Day"].astype(str).str.zfill(2),
+        format="%Y-%m-%d", errors="coerce",
+    )
+    df_gpm["Date"] = df_gpm["Date"].where(df_gpm["Date"].notna(), reconstructed)
+    log.info(f"4tripdata: {len(df_gpm)} rows, {df_gpm['Date'].notna().sum()} with valid Date after fill")
     df_work = df_work.merge(
         df_gpm[["Date", "ทะเบียนรถ", "# Trip"]],
         how="left",
@@ -184,6 +191,13 @@ def fetch_gsheet_trips(df_work: pd.DataFrame) -> pd.DataFrame:
     ws_q = spreadsheet.worksheet("q_data")
     df_gpm_q = pd.DataFrame(ws_q.get_all_records())
     df_gpm_q["Date"] = pd.to_datetime(df_gpm_q["Date"], format="%Y-%m-%d", errors="coerce")
+    # same date fill for q_data
+    reconstructed_q = pd.to_datetime(
+        df_gpm_q["Month"].astype(str) + "-" + df_gpm_q["Day"].astype(str).str.zfill(2),
+        format="%Y-%m-%d", errors="coerce",
+    )
+    df_gpm_q["Date"] = df_gpm_q["Date"].where(df_gpm_q["Date"].notna(), reconstructed_q)
+    log.info(f"q_data: {len(df_gpm_q)} rows, {df_gpm_q['Date'].notna().sum()} with valid Date after fill")
     df_work = df_work.merge(
         df_gpm_q[["Date", "ทะเบียนรถ", "#_Q"]],
         how="left",
@@ -227,11 +241,12 @@ def fetch_ac_cases() -> pd.DataFrame:
     data = resp.json()
     df = pd.DataFrame(data if isinstance(data, list) else next(v for v in data.values() if isinstance(v, list)))
 
-    df = df[["accident_case_id", "document_no_ac", "driver_name", "casestatus", "incident_datetime"]].copy()
+    df = df[["accident_case_id", "document_no_ac", "driver_name", "casestatus", "incident_datetime","fault_party"]].copy()
+
     df = df[df["casestatus"] != "Voided"]
     df["incident_datetime"] = pd.to_datetime(df["incident_datetime"], errors="coerce", format="mixed")
     df["mmyy"] = df["incident_datetime"].dt.strftime("%m/%Y")
-
+    df = df[df['fault_party']=="เป็นฝ่ายผิด"]
     driver_ac = (
         df.groupby(["mmyy", "driver_name"], dropna=False)
         .agg(total_ac=("document_no_ac", "size"))
@@ -349,5 +364,166 @@ def main():
     log.info("=== Driver Cost Pipeline DONE ===")
 
 
+def debug_merge():
+    """Diagnostic only — prints key join columns from both sides, no writes."""
+    print("\n" + "="*60)
+    print("DEBUG: checking 4tripdata merge keys")
+    print("="*60)
+
+    mongo_client = MongoClient(config.MONGO_URI, serverSelectionTimeoutMS=30000)
+
+    # ── MongoDB side (mirror fallback logic in fetch_vehicle_daily) ──
+    now = datetime.now()
+    mmyy = now.strftime("%m/%Y")
+    col = mongo_client[config.ATMS_DB][config.VEHICLE_DAILY_COLLECTION]
+
+    # try mmyy field first
+    cursor = col.find({"ฟลีท": "Asia", "mmyy": mmyy}, {"_id": 0, "วันที่": 1, "ทะเบียน": 1})
+    df_mongo = pd.DataFrame(list(cursor))
+    print(f"\n[MongoDB] direct mmyy={mmyy} query: {len(df_mongo)} rows")
+
+    # fallback: filter by วันที่ date prefix (same as fetch_vehicle_daily)
+    if df_mongo.empty:
+        print("  → 0 rows via mmyy field — trying fallback (all Asia, filter by วันที่ prefix)")
+        cursor = col.find({"ฟลีท": "Asia"}, {"_id": 0, "วันที่": 1, "ทะเบียน": 1})
+        df_all = pd.DataFrame(list(cursor))
+        print(f"  → All Asia rows fetched: {len(df_all)}")
+        if not df_all.empty:
+            df_all["mmyy_tmp"] = df_all["วันที่"].astype(str).str[3:10]
+            print(f"  → Sample mmyy_tmp values: {df_all['mmyy_tmp'].unique()[:10].tolist()}")
+            df_mongo = df_all[df_all["mmyy_tmp"] == mmyy].drop(columns=["mmyy_tmp"])
+            print(f"  → Rows after fallback filter for mmyy={mmyy}: {len(df_mongo)}")
+
+    mongo_client.close()
+
+    if not df_mongo.empty:
+        df_mongo["วันที่_parsed"] = pd.to_datetime(df_mongo["วันที่"], format="%d/%m/%Y", errors="coerce")
+        print("  Sample วันที่ (raw)   :", df_mongo["วันที่"].head(5).tolist())
+        print("  Sample วันที่ (parsed):", df_mongo["วันที่_parsed"].head(5).tolist())
+        print("  Sample ทะเบียน       :", df_mongo["ทะเบียน"].head(5).tolist())
+    else:
+        print("  !! No MongoDB rows found even after fallback — vehicle_daily_asia may be empty for this month")
+
+    # ── Google Sheet side ────────────────────────────────────
+    gs = _gsheet_client()
+    ws = gs.open_by_key(config.SPREADSHEET_ID).worksheet("4tripdata")
+    df_gpm = pd.DataFrame(ws.get_all_records())
+    print(f"\n[GSheet]  4tripdata rows total: {len(df_gpm)}")
+    print(f"  Columns: {df_gpm.columns.tolist()}")
+
+    df_gpm["Date_parsed"] = pd.to_datetime(df_gpm["Date"], format="%Y-%m-%d", errors="coerce")
+    current_month_rows = df_gpm[df_gpm["Date_parsed"].dt.strftime("%m/%Y") == mmyy]
+    print(f"  Rows where Date matches mmyy={mmyy}: {len(current_month_rows)}")
+
+    print("  Sample Date (raw)    :", df_gpm["Date"].head(5).tolist())
+    print("  Sample Date (parsed) :", df_gpm["Date_parsed"].head(5).tolist())
+    print("  Sample ทะเบียนรถ     :", df_gpm["ทะเบียนรถ"].head(5).tolist())
+
+    # ── Rows with real trips this month ──────────────────────
+    has_trips = current_month_rows[current_month_rows["# Trip"].apply(pd.to_numeric, errors="coerce").fillna(0) > 0]
+    print(f"\n  Rows with # Trip > 0 in current month: {len(has_trips)}")
+    if not has_trips.empty:
+        print(has_trips[["Date", "ทะเบียนรถ", "# Trip"]].head(5).to_string(index=False))
+
+    # ── Overlap check ─────────────────────────────────────────
+    if not df_mongo.empty and not df_gpm.empty:
+        mongo_plates = set(df_mongo["ทะเบียน"].astype(str).str.strip())
+        sheet_plates = set(df_gpm["ทะเบียนรถ"].astype(str).str.strip())
+        overlap = mongo_plates & sheet_plates
+        print(f"\n  Plate overlap (MongoDB ∩ GSheet): {len(overlap)} plates")
+        print(f"  MongoDB-only plates (sample)    : {list(mongo_plates - sheet_plates)[:5]}")
+        print(f"  GSheet-only plates  (sample)    : {list(sheet_plates - mongo_plates)[:5]}")
+        if overlap:
+            print(f"  Overlapping plates  (sample)    : {list(overlap)[:5]}")
+
+    # ── Actual merge result check ──────────────────────────────
+    if not df_mongo.empty and not df_gpm.empty:
+        print("\n--- Merge result (WITH date reconstruction fix) ---")
+        df_mongo["วันที่_parsed"] = pd.to_datetime(df_mongo["วันที่"], format="%d/%m/%Y", errors="coerce")
+
+        # apply the fix: reconstruct Date from Month + Day where empty
+        df_gpm["Date_parsed"] = pd.to_datetime(df_gpm["Date"], format="%Y-%m-%d", errors="coerce")
+        reconstructed_debug = pd.to_datetime(
+            df_gpm["Month"].astype(str) + "-" + df_gpm["Day"].astype(str).str.zfill(2),
+            format="%Y-%m-%d", errors="coerce",
+        )
+        df_gpm["Date_parsed"] = df_gpm["Date_parsed"].where(df_gpm["Date_parsed"].notna(), reconstructed_debug)
+        may_rows = (df_gpm["Date_parsed"].dt.strftime("%m/%Y") == mmyy).sum()
+        print(f"  GSheet rows with valid Date for {mmyy} AFTER reconstruction: {may_rows}")
+
+        merged = df_mongo.merge(
+            df_gpm[["Date_parsed", "ทะเบียนรถ", "# Trip"]],
+            how="left",
+            left_on=["วันที่_parsed", "ทะเบียน"],
+            right_on=["Date_parsed",  "ทะเบียนรถ"],
+        )
+        matched   = merged["# Trip"].notna().sum()
+        unmatched = merged["# Trip"].isna().sum()
+        print(f"  Total merged rows : {len(merged)}")
+        print(f"  Matched (# Trip not null) : {matched}")
+        print(f"  Unmatched (# Trip null)   : {unmatched}")
+
+        hits = merged[merged["# Trip"].notna() & (merged["# Trip"] > 0)]
+        print(f"  Rows with # Trip > 0      : {len(hits)}")
+        if not hits.empty:
+            print("  Sample matched rows:")
+            print(hits[["วันที่", "ทะเบียน", "Date_parsed", "ทะเบียนรถ", "# Trip"]].head(5).to_string(index=False))
+        else:
+            print("  !! No rows matched with # Trip > 0 — join is producing no hits")
+            # show one overlapping plate's data from both sides
+            if overlap:
+                sample_plate = list(overlap)[0]
+                print(f"\n  Investigating plate: {sample_plate}")
+                print("  MongoDB dates for this plate:")
+                print(df_mongo[df_mongo["ทะเบียน"] == sample_plate]["วันที่_parsed"].head(5).tolist())
+                print("  GSheet dates for this plate:")
+                gsheet_rows = df_gpm[df_gpm["ทะเบียนรถ"] == sample_plate]
+                print(gsheet_rows[["Date_parsed", "# Trip"]].head(5).to_string(index=False))
+
+    # ── เบอร์รถ overlap check ──────────────────────────────────
+    print("\n--- เบอร์รถ overlap check ---")
+    col2 = MongoClient(config.MONGO_URI, serverSelectionTimeoutMS=30000)[config.ATMS_DB][config.VEHICLE_DAILY_COLLECTION]
+    cursor2 = col2.find({"ฟลีท": "Asia"}, {"_id": 0, "วันที่": 1, "เบอร์รถ": 1, "ทะเบียน": 1})
+    df_mongo2 = pd.DataFrame(list(cursor2))
+    df_mongo2["mmyy_tmp"] = df_mongo2["วันที่"].astype(str).str[3:10]
+    df_mongo2 = df_mongo2[df_mongo2["mmyy_tmp"] == mmyy]
+
+    mongo_bor = set(df_mongo2["เบอร์รถ"].astype(str).str.strip())
+    sheet_bor = set(df_gpm["เบอร์รถ"].astype(str).str.strip())
+    overlap_bor = mongo_bor & sheet_bor
+
+    print(f"  MongoDB เบอร์รถ unique  : {len(mongo_bor)}")
+    print(f"  GSheet  เบอร์รถ unique  : {len(sheet_bor)}")
+    print(f"  Overlap เบอร์รถ         : {len(overlap_bor)}")
+    print(f"  Sample MongoDB เบอร์รถ  : {list(mongo_bor)[:8]}")
+    print(f"  Sample GSheet  เบอร์รถ  : {list(sheet_bor)[:8]}")
+    print(f"  Sample overlap เบอร์รถ  : {list(overlap_bor)[:8]}")
+
+    # test merge on เบอร์รถ + date
+    if not df_mongo2.empty:
+        df_mongo2["วันที่_parsed"] = pd.to_datetime(df_mongo2["วันที่"], format="%d/%m/%Y", errors="coerce")
+        merged_bor = df_mongo2.merge(
+            df_gpm[["Date_parsed", "เบอร์รถ", "# Trip"]],
+            how="left",
+            left_on=["วันที่_parsed", "เบอร์รถ"],
+            right_on=["Date_parsed",   "เบอร์รถ"],
+        )
+        matched_bor   = merged_bor["# Trip"].notna().sum()
+        has_trips_bor = (merged_bor["# Trip"].fillna(0) > 0).sum()
+        print(f"\n  Merge on (date + เบอร์รถ):")
+        print(f"    Matched rows       : {matched_bor} / {len(merged_bor)}")
+        print(f"    Rows with # Trip>0 : {has_trips_bor}")
+        if has_trips_bor > 0:
+            hits2 = merged_bor[merged_bor["# Trip"] > 0]
+            print("    Sample matched rows:")
+            print(hits2[["วันที่", "เบอร์รถ", "# Trip"]].head(5).to_string(index=False))
+
+    print("\n" + "="*60 + "\n")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "debug":
+        debug_merge()
+    else:
+        main()
